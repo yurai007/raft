@@ -6,7 +6,7 @@ import kotlin.collections.mutableListOf
 // ref: https://raft.github.io/raft.pdf
 
 enum class State {
-    INITIAL, DONE
+    FOLLOWER_INITIAL, FOLLOWER_DONE, CANDIDATE, LEADER_INITIAL, LEADER_DONE
 }
 
 interface Message
@@ -19,11 +19,12 @@ abstract class Node {
     abstract suspend fun run()
     protected val logState = HashMap<Char, Int>()
     protected var log = mutableListOf<MetaEntry>()
-    protected var state: State = State.INITIAL
+    protected var state: State = State.CANDIDATE
     var currentTerm = 0
     var commitIndex = 0
     protected var lastApplied = 0
     private val debug = true
+    protected val receiveTimeoutMs : Long = 10
 
     fun trackLog() {
         if (debug) {
@@ -35,12 +36,16 @@ abstract class Node {
 open class Follower : Node() {
 
     override suspend fun run() {
-        state = State.INITIAL
+        state = State.FOLLOWER_INITIAL
         currentTerm++
         commitIndex = max(log.size, 0)
-        while (!done(receiveHeartbeat())) {
-
-            val appendEntries = receiveAppendEntriesReq()
+        var maybeHeartBeat = receiveHeartbeat()
+        var maybeAppendEntries : AppendEntriesReq? = null
+        while (maybeHeartBeat != null && !done(maybeHeartBeat!!)) {
+            maybeAppendEntries = receiveAppendEntriesReq()
+            if (maybeAppendEntries == null)
+                break
+            val appendEntries = maybeAppendEntries!!
             var apply = true
             val prevIndex = appendEntries.prevIndex
             val prevTerm = appendEntries.prevTerm
@@ -71,8 +76,7 @@ open class Follower : Node() {
                     }
                 }
             }
-            val rep = AppendEntriesResp(currentTerm, apply)
-            sendAppendEntriesResp(rep)
+            sendAppendEntriesResp(AppendEntriesResp(currentTerm, apply))
             val metaEntry = appendEntries.metaEntry
             val leaderCommit = appendEntries.leaderCommit
             val (id, value) = metaEntry.entry
@@ -88,10 +92,16 @@ open class Follower : Node() {
                 println("Follower $this: no consensus for $id")
                 trackLog()
             }
+            maybeHeartBeat = receiveHeartbeat()
         }
-        state = State.DONE
-        println("Follower $this: done with commitIndex=$commitIndex")
-        trackLog()
+        if (maybeHeartBeat != null && maybeAppendEntries != null) {
+            state = State.FOLLOWER_DONE
+            println("Follower $this: done with commitIndex=$commitIndex")
+            trackLog()
+        } else {
+            state = State.CANDIDATE
+            println("Follower $this: Heartbeat or AppendEntriesReq failed with election timeout")
+        }
     }
     // slice
     private fun shrinkUntil(index : Int) {
@@ -108,9 +118,19 @@ open class Follower : Node() {
     suspend fun sendHeartbeat(done : Boolean) = channelToLeader.send(HeartBeat(done))
     suspend fun sendAppendEntriesReq(entriesReq : AppendEntriesReq) = channelToLeader.send(entriesReq)
     private suspend fun sendAppendEntriesResp(entriesResp : AppendEntriesResp) = channelToLeader.send(entriesResp)
-    private suspend fun receiveAppendEntriesReq() : AppendEntriesReq = channelToLeader.receive() as AppendEntriesReq
-    suspend fun receiveAppendEntriesResp() : AppendEntriesResp = channelToLeader.receive() as AppendEntriesResp
-    private suspend fun receiveHeartbeat() : HeartBeat = channelToLeader.receive() as HeartBeat
+
+    private suspend fun receiveAppendEntriesReq() : AppendEntriesReq? {
+        val message : Message? = withTimeoutOrNull(receiveTimeoutMs) { channelToLeader.receive() }
+        return message as? AppendEntriesReq
+    }
+    suspend fun receiveAppendEntriesResp() : AppendEntriesResp? {
+        val message : Message? = withTimeoutOrNull(receiveTimeoutMs) { channelToLeader.receive() }
+        return message as? AppendEntriesResp
+    }
+    private suspend fun receiveHeartbeat() : HeartBeat? {
+        val message : Message? = withTimeoutOrNull(receiveTimeoutMs) { channelToLeader.receive() }
+        return message as? HeartBeat
+    }
     private fun done(heartBeat : HeartBeat) : Boolean = heartBeat.done
 
     private val channelToLeader = Channel<Message>()
@@ -119,11 +139,11 @@ open class Follower : Node() {
 class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>) : Node() {
 
     override suspend fun run() {
-        state = State.INITIAL
+        state = State.LEADER_INITIAL
         currentTerm++
         println("Leader of term $currentTerm")
         entriesToReplicate.forEach { (id, value) ->
-            followers.forEach {it.sendHeartbeat(false)}
+            followers.forEach { sendHeartbeat(it, false)}
             var entry = MetaEntry(Pair(id, value), currentTerm)
             lastApplied++
             // [5.3]
@@ -135,7 +155,11 @@ class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>
                     val prevIndex = min(replicaNextIndex(it) - 1, log.size - 1)
                     val prevTerm = if (prevIndex >= 0) log[prevIndex].term  else 0
                     it.sendAppendEntriesReq(AppendEntriesReq(entry, currentTerm, prevIndex, prevTerm, commitIndex))
-                    val response = it.receiveAppendEntriesResp()
+                    val maybeResponse = it.receiveAppendEntriesResp()
+                    if (maybeResponse == null){
+                        break
+                    }
+                    val response = maybeResponse!!
                     val expected = AppendEntriesResp(currentTerm, true)
                     if (response != expected) {
                         println("Leader: No consensus for $entry")
@@ -144,7 +168,7 @@ class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>
                         if (replicaNextIndex(it) >= 0) {
                             entry = log[replicaNextIndex(it)]
                         }
-                        it.sendHeartbeat(false)
+                        sendHeartbeat(it, false)
                         trackLog()
                     } else if (replicaNextIndex(it) == log.size - 1) {
                         followerIsDone = true
@@ -156,7 +180,7 @@ class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>
                         } else {
                             entry = MetaEntry(Pair(id, value), currentTerm)
                         }
-                        it.sendHeartbeat(false)
+                        sendHeartbeat(it, false)
                     }
                 } while (!followerIsDone)
             }
@@ -172,8 +196,8 @@ class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>
             commitIndex = max(majorityCommitIndex, commitIndex + 1)
             println("Leader: $id := $value")
         }
-        followers.forEach {it.sendHeartbeat(true)}
-        state = State.DONE
+        followers.forEach {sendHeartbeat(it, true)}
+        state = State.LEADER_DONE
         println("Leader: done with commitIndex=$commitIndex")
     }
 
@@ -181,11 +205,23 @@ class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>
         entriesToReplicate = entriesToReplicate_
     }
 
+    fun setupDelaysForReplicasChannel(delayedFollowers_ : Set<Follower>) {
+        delayedFollowers = delayedFollowers_
+    }
+
+    private suspend fun sendHeartbeat(replica : Follower, done : Boolean) {
+        if (replica in delayedFollowers) {
+            delay(2*receiveTimeoutMs)
+        }
+        replica.sendHeartbeat(done)
+    }
+
     private fun replicaNextIndex(replica : Follower) : Int = nextIndex[replica]!!
     private val followers = followers
     private val nextIndex = HashMap<Follower, Int>()
     private val matchIndex = HashMap<Follower, Int>()
     private var entriesToReplicate = entriesToReplicate
+    var delayedFollowers = setOf<Follower>()
     init {
         this.followers.forEach {
             nextIndex[it] = 0
@@ -389,6 +425,19 @@ fun oneLeaderOneFollowerShouldRemoveButNotAllOldEntriesAndCatchUpWithConsensus()
     println()
 }
 
+fun oneFailingLeaderOneFollowerScenarioWithNoConsensus() = runBlocking {
+    println("oneFailingLeaderOneFollowerScenarioWithNoConsensus")
+    val follower = Follower()
+    val followers = listOf(follower)
+    val set = setOf(follower)
+    val entriesToReplicate = hashMapOf('x' to 1, 'y' to 2)
+    val leader = Leader(followers, entriesToReplicate)
+    leader.setupDelaysForReplicasChannel(set)
+    println("Term 1 - HeartBeat is delayed, follower become candidate")
+    launchLeaderAndFollowers(leader, followers)
+    println()
+}
+
 fun main() {
     oneLeaderOneFollowerScenarioWithConsensus()
     oneLeaderOneFollowerMoreEntriesScenarioWithConsensus()
@@ -398,4 +447,5 @@ fun main() {
     oneLeaderOneFollowerShouldCatchUpWithConsensus()
     oneLeaderOneFollowerShouldRemoveOldEntriesAndCatchUpWithConsensus()
     oneLeaderOneFollowerShouldRemoveButNotAllOldEntriesAndCatchUpWithConsensus()
+    oneFailingLeaderOneFollowerScenarioWithNoConsensus()
 }
