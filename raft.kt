@@ -17,12 +17,12 @@ data class MetaEntry(val entry : Pair<Char, Int>, val term : Int)
 
 abstract class Node {
     abstract suspend fun run()
-    val logState = HashMap<Char, Int>()
-    var log = mutableListOf<MetaEntry>()
-    var state: State = State.INITIAL
+    protected val logState = HashMap<Char, Int>()
+    protected var log = mutableListOf<MetaEntry>()
+    protected var state: State = State.INITIAL
     var currentTerm = 0
     var commitIndex = 0
-    var lastApplied = 0
+    protected var lastApplied = 0
     private val debug = true
 
     fun trackLog() {
@@ -217,44 +217,57 @@ suspend fun launchLeaderAndFollowers(leader : Leader, followers : List<Follower>
 }
 
 fun oneLeaderOneFollowerScenarioWithConsensus() = runBlocking {
+    println("oneLeaderOneFollowerScenarioWithConsensus")
     val followers = listOf(Follower())
     val entriesToReplicate = hashMapOf('x' to 1, 'y' to 2)
     val leader = Leader(followers, entriesToReplicate)
     launchLeaderAndFollowers(leader, followers)
-    followers.forEach {assert(it.verifyLog(mutableListOf(MetaEntry('x' to 1, 1),
-        MetaEntry('y' to 2, 1) ))) }
+    followers.forEach {
+        assert(it.verifyLog(mutableListOf(MetaEntry('x' to 1, 1), MetaEntry('y' to 2, 1) )))
+        assert(it.commitIndex == 2 && it.currentTerm == 1)
+    }
     println()
 }
 
 fun oneLeaderOneFollowerMoreEntriesScenarioWithConsensus() = runBlocking {
+    println("oneLeaderOneFollowerMoreEntriesScenarioWithConsensus")
     val followers = listOf(Follower())
     val entriesToReplicate = hashMapOf('1' to 1, '2' to 2, '3' to 3, '4' to 2, '5' to 1, '6' to 3)
     val leader = Leader(followers, entriesToReplicate)
     launchLeaderAndFollowers(leader, followers)
-    followers.forEach {assert(it.verifyLog(mutableListOf(MetaEntry('1' to 1, 1),
-        MetaEntry('2' to 2, 1), MetaEntry('3' to 3, 1), MetaEntry('4' to 2, 1),
-        MetaEntry('5' to 1, 1), MetaEntry('6' to 3, 1)))) }
+    followers.forEach {
+        assert(it.verifyLog(mutableListOf(MetaEntry('1' to 1, 1),
+            MetaEntry('2' to 2, 1), MetaEntry('3' to 3, 1), MetaEntry('4' to 2, 1),
+            MetaEntry('5' to 1, 1), MetaEntry('6' to 3, 1))))
+        assert(it.commitIndex == 6 && it.currentTerm == 1)
+    }
     println()
 }
 
 fun oneLeaderManyFollowersScenarioWithConsensus() = runBlocking {
+    println("oneLeaderManyFollowersScenarioWithConsensus")
     val followers = listOf(Follower(), Follower(), Follower(), Follower(), Follower(), Follower(), Follower(),
         Follower(), Follower(), Follower(), Follower(), Follower(), Follower())
     val entriesToReplicate = hashMapOf('x' to 1, 'y' to 2)
     val leader = Leader(followers, entriesToReplicate)
     launchLeaderAndFollowers(leader, followers)
-    followers.forEach {assert(it.verifyLog(mutableListOf(MetaEntry('x' to 1, 1),
-        MetaEntry('y' to 2, 1) ))) }
+    followers.forEach {
+        assert(it.verifyLog(mutableListOf(MetaEntry('x' to 1, 1), MetaEntry('y' to 2, 1) )))
+        assert(it.commitIndex == 2 && it.currentTerm == 1)
+    }
     println()
 }
 
 fun oneLeaderManyFollowersWithArtificialOneScenarioWithConsensus() = runBlocking {
+    println("oneLeaderManyFollowersWithArtificialOneScenarioWithConsensus")
     val followers = listOf(Follower(), Follower(), Follower(), Follower(), Follower(), ArtificialFollower())
     val entriesToReplicate = hashMapOf('x' to 1, 'y' to 2)
     val leader = Leader(followers, entriesToReplicate)
     launchLeaderAndFollowers(leader, followers)
-    followers.forEach {assert(it.verifyLog(mutableListOf(MetaEntry('x' to 1, 1),
-        MetaEntry('y' to 2, 1) ))) }
+    followers.forEach {
+        assert(it.verifyLog(mutableListOf(MetaEntry('x' to 1, 1), MetaEntry('y' to 2, 1) )))
+        assert(it.commitIndex == 2 && it.currentTerm == 1)
+    }
     println()
 }
 
@@ -272,8 +285,11 @@ fun oneLeaderOneFollowerWithArtificialOneScenarioWithConsensus() = runBlocking {
     leader.replicateEntries(entries2)
     println("Term 2 - replicate entries2")
     launchLeaderAndFollowers(leader, followers)
-    followers.forEach {assert(it.verifyLog(mutableListOf(MetaEntry('a' to 1, 1),
-        MetaEntry('b' to 2, 1), MetaEntry('d' to 4, 2), MetaEntry('c' to 3, 2) ))) }
+    followers.forEach {
+        assert(it.verifyLog(mutableListOf(MetaEntry('a' to 1, 1),
+            MetaEntry('b' to 2, 1), MetaEntry('d' to 4, 2), MetaEntry('c' to 3, 2) )))
+        assert(it.commitIndex == 4 && it.currentTerm == 2)
+    }
     println()
 }
 
@@ -297,9 +313,11 @@ fun oneLeaderOneFollowerShouldCatchUpWithConsensus() = runBlocking {
     leader.replicateEntries(entries3)
     println("Term 3 - replicate entries3; follower log is going to be aligned")
     launchLeaderAndFollowers(leader, followers)
-    followers.forEach {assert(it.verifyLog(mutableListOf(MetaEntry('a' to 1, 1),
-        MetaEntry('b' to 2, 1), MetaEntry('d' to 4, 2), MetaEntry('c' to 3, 2),
-        MetaEntry('e' to 5, 3)))) }
+    followers.forEach {
+        assert(it.verifyLog(mutableListOf(MetaEntry('a' to 1, 1),
+            MetaEntry('b' to 2, 1), MetaEntry('d' to 4, 2), MetaEntry('c' to 3, 2), MetaEntry('e' to 5, 3))))
+        assert(it.commitIndex == 5 && it.currentTerm == 3)
+    }
     println()
 }
 
@@ -323,19 +341,20 @@ fun oneLeaderOneFollowerShouldRemoveOldEntriesAndCatchUpWithConsensus() = runBlo
     println("Term 3 - replicate entries2")
     launchLeaderAndFollowers(leader, followers)
 
-    artificialFollower.poison(2, mutableListOf(MetaEntry('a' to 1, 1),
-        MetaEntry('z' to 3, 2)))
+    artificialFollower.poison(2, mutableListOf(MetaEntry('a' to 1, 1), MetaEntry('z' to 3, 2)))
     leader.replicateEntries(entries3)
     println("Term 4 - replicate entries3; follower log is going to be aligned")
     launchLeaderAndFollowers(leader, followers)
-    followers.forEach {assert(it.verifyLog(mutableListOf(MetaEntry('a' to 1, 1),
-        MetaEntry('d' to 4, 3), MetaEntry('c' to 3, 3),
-        MetaEntry('e' to 5, 4)))) }
+    followers.forEach {
+        assert(it.verifyLog(mutableListOf(MetaEntry('a' to 1, 1),
+            MetaEntry('d' to 4, 3), MetaEntry('c' to 3, 3), MetaEntry('e' to 5, 4))))
+        assert(it.commitIndex == 4 && it.currentTerm == 4)
+    }
     println()
 }
 
 fun oneLeaderOneFollowerShouldRemoveButNotAllOldEntriesAndCatchUpWithConsensus() = runBlocking {
-    println("oneLeaderOneFollowerWithArtificialOneScenarioWithConsensus2")
+    println("oneLeaderOneFollowerShouldRemoveButNotAllOldEntriesAndCatchUpWithConsensus")
     val entries1 = hashMapOf('a' to 1)
     val entries2 = hashMapOf('c' to 3, 'd' to 4)
     val entries3 = hashMapOf('e' to 5)
@@ -362,8 +381,11 @@ fun oneLeaderOneFollowerShouldRemoveButNotAllOldEntriesAndCatchUpWithConsensus()
     leader.replicateEntries(entries3)
     println("Term 5 - replicate entries3; follower log is going to be aligned")
     launchLeaderAndFollowers(leader, followers)
-    followers.forEach {assert(it.verifyLog(mutableListOf(MetaEntry('a' to 1, 1),
-        MetaEntry('d' to 4, 4), MetaEntry('c' to 3, 4), MetaEntry('e' to 5, 5)))) }
+    followers.forEach {
+        assert(it.verifyLog(mutableListOf(MetaEntry('a' to 1, 1),
+            MetaEntry('d' to 4, 4), MetaEntry('c' to 3, 4), MetaEntry('e' to 5, 5))))
+        assert(it.commitIndex == 4 && it.currentTerm == 5)
+    }
     println()
 }
 
