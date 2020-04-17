@@ -19,12 +19,12 @@ abstract class Node {
     abstract suspend fun run()
     protected val logState = HashMap<Char, Int>()
     protected var log = mutableListOf<MetaEntry>()
-    protected var state: State = State.CANDIDATE
+    var state: State = State.CANDIDATE
     var currentTerm = 0
     var commitIndex = 0
     protected var lastApplied = 0
     private val debug = true
-    protected val receiveTimeoutMs : Long = 10
+    protected val rpcTimeoutMs : Long = 25
 
     fun trackLog() {
         if (debug) {
@@ -100,7 +100,7 @@ open class Follower : Node() {
             trackLog()
         } else {
             state = State.CANDIDATE
-            println("Follower $this: Heartbeat or AppendEntriesReq failed with election timeout")
+            println("Follower $this: Heartbeat or AppendEntriesReq failed with election timeout. Start election.")
         }
     }
     // slice
@@ -115,20 +115,35 @@ open class Follower : Node() {
 
     fun verifyLog(expectedLog : MutableList<MetaEntry> ) : Boolean = expectedLog == log
 
-    suspend fun sendHeartbeat(done : Boolean) = channelToLeader.send(HeartBeat(done))
-    suspend fun sendAppendEntriesReq(entriesReq : AppendEntriesReq) = channelToLeader.send(entriesReq)
-    private suspend fun sendAppendEntriesResp(entriesResp : AppendEntriesResp) = channelToLeader.send(entriesResp)
+    suspend fun sendHeartbeat(done : Boolean) : Boolean? {
+        return withTimeoutOrNull(rpcTimeoutMs) {
+            channelToLeader.send(HeartBeat(done))
+            true
+        }
+    }
+    suspend fun sendAppendEntriesReq(entriesReq : AppendEntriesReq) : Boolean? {
+        return withTimeoutOrNull(rpcTimeoutMs) {
+            channelToLeader.send(entriesReq)
+            true
+        }
+    }
+    private suspend fun sendAppendEntriesResp(entriesResp : AppendEntriesResp) : Boolean? {
+        return withTimeoutOrNull(rpcTimeoutMs) {
+            channelToLeader.send(entriesResp)
+            true
+        }
+    }
 
     private suspend fun receiveAppendEntriesReq() : AppendEntriesReq? {
-        val message : Message? = withTimeoutOrNull(receiveTimeoutMs) { channelToLeader.receive() }
+        val message : Message? = withTimeoutOrNull(rpcTimeoutMs) { channelToLeader.receive() }
         return message as? AppendEntriesReq
     }
     suspend fun receiveAppendEntriesResp() : AppendEntriesResp? {
-        val message : Message? = withTimeoutOrNull(receiveTimeoutMs) { channelToLeader.receive() }
+        val message : Message? = withTimeoutOrNull(rpcTimeoutMs) { channelToLeader.receive() }
         return message as? AppendEntriesResp
     }
     private suspend fun receiveHeartbeat() : HeartBeat? {
-        val message : Message? = withTimeoutOrNull(receiveTimeoutMs) { channelToLeader.receive() }
+        val message : Message? = withTimeoutOrNull(rpcTimeoutMs) { channelToLeader.receive() }
         return message as? HeartBeat
     }
     private fun done(heartBeat : HeartBeat) : Boolean = heartBeat.done
@@ -143,7 +158,11 @@ class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>
         currentTerm++
         println("Leader of term $currentTerm")
         entriesToReplicate.forEach { (id, value) ->
-            followers.forEach { sendHeartbeat(it, false)}
+            followers.forEach {
+                if (sendHeartbeat(it, false) == null) {
+                    return fallbackTo(State.CANDIDATE)
+                }
+            }
             var entry = MetaEntry(Pair(id, value), currentTerm)
             lastApplied++
             // [5.3]
@@ -157,18 +176,25 @@ class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>
                     it.sendAppendEntriesReq(AppendEntriesReq(entry, currentTerm, prevIndex, prevTerm, commitIndex))
                     val maybeResponse = it.receiveAppendEntriesResp()
                     if (maybeResponse == null){
+                        println("Leader: No AppendEntriesResp from $it. Should try again later")
                         break
                     }
                     val response = maybeResponse!!
                     val expected = AppendEntriesResp(currentTerm, true)
                     if (response != expected) {
                         println("Leader: No consensus for $entry")
+                        if (!response.success && response.term > currentTerm) {
+                            // [5.1]
+                            return fallbackTo(State.FOLLOWER_INITIAL)
+                        }
                         // [5.3]
                         nextIndex[it] = replicaNextIndex(it) - 1
                         if (replicaNextIndex(it) >= 0) {
                             entry = log[replicaNextIndex(it)]
                         }
-                        sendHeartbeat(it, false)
+                        if (sendHeartbeat(it, false) == null) {
+                            return fallbackTo(State.CANDIDATE)
+                        }
                         trackLog()
                     } else if (replicaNextIndex(it) == log.size - 1) {
                         followerIsDone = true
@@ -180,7 +206,9 @@ class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>
                         } else {
                             entry = MetaEntry(Pair(id, value), currentTerm)
                         }
-                        sendHeartbeat(it, false)
+                        if (sendHeartbeat(it, false) == null) {
+                            return fallbackTo(State.CANDIDATE)
+                        }
                     }
                 } while (!followerIsDone)
             }
@@ -209,11 +237,16 @@ class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>
         delayedFollowers = delayedFollowers_
     }
 
-    private suspend fun sendHeartbeat(replica : Follower, done : Boolean) {
+    private suspend fun sendHeartbeat(replica : Follower, done : Boolean) : Boolean? {
         if (replica in delayedFollowers) {
-            delay(2*receiveTimeoutMs)
+            delay(2*rpcTimeoutMs)
         }
-        replica.sendHeartbeat(done)
+        return replica.sendHeartbeat(done)
+    }
+
+    private fun fallbackTo(state : State) {
+        this.state = state
+        println("Leader: need to fallback to state=$state")
     }
 
     private fun replicaNextIndex(replica : Follower) : Int = nextIndex[replica]!!
@@ -433,8 +466,9 @@ fun oneFailingLeaderOneFollowerScenarioWithNoConsensus() = runBlocking {
     val entriesToReplicate = hashMapOf('x' to 1, 'y' to 2)
     val leader = Leader(followers, entriesToReplicate)
     leader.setupDelaysForReplicasChannel(set)
-    println("Term 1 - HeartBeat is delayed, follower become candidate")
+    println("Term 1 - HeartBeat is delayed, all servers become candidates")
     launchLeaderAndFollowers(leader, followers)
+    assert(leader.state == State.CANDIDATE && follower.state == State.CANDIDATE)
     println()
 }
 
