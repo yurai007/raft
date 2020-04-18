@@ -13,18 +13,27 @@ interface Message
 data class HeartBeat(val done : Boolean = false) : Message
 data class AppendEntriesReq(val metaEntry : MetaEntry, val term : Int, val prevIndex : Int, val prevTerm : Int, val leaderCommit : Int) : Message
 data class AppendEntriesResp(val term : Int, val success : Boolean) : Message
+data class RequestVoteReq(val term : Int, val candidateId : Int, val lastLogIndex : Int, val lastLogTerm : Int) : Message
+data class RequestVoteResp(val term : Int, val voteGranted : Boolean) : Message
 data class MetaEntry(val entry : Pair<Char, Int>, val term : Int)
 
-abstract class Node {
+abstract class Node() {
     abstract suspend fun run()
-    protected val logState = HashMap<Char, Int>()
+    protected var logState = HashMap<Char, Int>()
     protected var log = mutableListOf<MetaEntry>()
-    var state: State = State.CANDIDATE
+    var state: State = State.FOLLOWER_INITIAL
+
     var currentTerm = 0
     var commitIndex = 0
     protected var lastApplied = 0
     private val debug = true
     protected val rpcTimeoutMs : Long = 25
+
+    constructor(logState : HashMap<Char, Int>, log : MutableList<MetaEntry>, state : State) : this() {
+        this.logState = logState
+        this.log = log
+        this.state = state
+    }
 
     fun trackLog() {
         if (debug) {
@@ -33,7 +42,7 @@ abstract class Node {
     }
 }
 
-open class Follower : Node() {
+open class Follower() : Node() {
 
     override suspend fun run() {
         state = State.FOLLOWER_INITIAL
@@ -148,6 +157,12 @@ open class Follower : Node() {
     }
     private fun done(heartBeat : HeartBeat) : Boolean = heartBeat.done
 
+    constructor(logState : HashMap<Char, Int>, log : MutableList<MetaEntry>, state : State) : this()  {
+        super.logState = logState
+        super.log = log
+        super.state = state
+    }
+
     private val channelToLeader = Channel<Message>()
 }
 
@@ -261,6 +276,93 @@ class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>
             matchIndex[it] = -1
         }
     }
+
+    constructor(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>,
+                logState : HashMap<Char, Int>, log : MutableList<MetaEntry>, state : State) : this(followers, entriesToReplicate)  {
+        super.logState = logState
+        super.log = log
+        super.state = state
+    }
+}
+
+class Candidate(otherCandidates : List<Candidate>, logState : HashMap<Char, Int>, log : MutableList<MetaEntry>, state : State) : Node(logState, log, state) {
+
+    override suspend fun run() {
+        state = State.CANDIDATE
+        currentTerm++
+        var endOfElection = false
+        // only happy path for now
+        while (!endOfElection) {
+            otherCandidates.forEach {
+                val lastLogIndex = 0
+                val lastLogTerm = 0
+                val requestVoteReq = RequestVoteReq(currentTerm, hashCode(), lastLogIndex, lastLogTerm)
+                sendRequestVoteReq(it, requestVoteReq)
+            }
+            var votesForMe = 0
+            otherCandidates.forEach {
+                val requestVoteResp = receiveRequestVoteResp(it)
+                if (requestVoteResp!!.voteGranted) {
+                    votesForMe++
+                }
+            }
+            if (votesForMe > otherCandidates.size/2) {
+                state = State.LEADER_INITIAL
+                endOfElection = true
+            }
+        }
+    }
+
+    suspend fun sendRequestVoteReq(candidate : Candidate, requestVote : RequestVoteReq) : Boolean? {
+        return withTimeoutOrNull(rpcTimeoutMs) {
+            candidate.channel.send(requestVote)
+            true
+        }
+    }
+
+    private suspend fun receiveRequestVoteResp(candidate : Candidate) : RequestVoteResp? {
+        val message : Message? = withTimeoutOrNull(rpcTimeoutMs) { candidate.channel.receive() }
+        return message as? RequestVoteResp
+    }
+
+    private val otherCandidates = otherCandidates
+    private val channel = Channel<Message>()
+}
+
+class Server(asLeader : Boolean, entriesToReplicate : HashMap<Char, Int>, otherNodes : MutableList<Node>) : Node() {
+
+    override suspend fun run() {
+        while (true) {
+            node.run()
+            when (state) {
+                State.FOLLOWER_INITIAL -> {
+                    node = Follower(logState, log, state)
+                }
+                State.LEADER_INITIAL -> {
+                    val knownFollowers = otherNodes.filter { it is Follower } as List<Follower>
+                    node = Leader(knownFollowers, entriesToReplicate, logState, log, state)
+                }
+                State.CANDIDATE -> {
+                    val knownCandidates = otherNodes.filter { it is Candidate } as List<Candidate>
+                    node = Candidate(knownCandidates, logState, log, state)
+                }
+                State.FOLLOWER_DONE -> return
+                State.LEADER_DONE -> return
+            }
+        }
+    }
+
+    private fun createNode(asLeader : Boolean) : Node {
+        if (asLeader) {
+            val knownFollowers = otherNodes.filter { it is Follower } as List<Follower>
+            return Leader(knownFollowers, entriesToReplicate, logState, log, state)
+        }
+        return Follower(logState, log, state)
+    }
+
+    private val entriesToReplicate = entriesToReplicate
+    private val otherNodes = otherNodes
+    private var node : Node = createNode(asLeader)
 }
 
 class ArtificialFollower : Follower() {
@@ -283,6 +385,30 @@ suspend fun launchLeaderAndFollowers(leader : Leader, followers : List<Follower>
             it.run()
         } catch (e : Exception) { println("Follower: failed") }
     } }
+}
+
+suspend fun launchServers(servers : List<Node>) = runBlocking {
+    servers.forEach { launch {
+        try {
+            it.run()
+        } catch (e : Exception) { println("$it: failed") }
+    } }
+}
+
+fun oneLeaderOneFollowerScenarioWithConsensus__new() = runBlocking {
+    println("oneLeaderOneFollowerScenarioWithConsensus")
+    val entriesToReplicate = hashMapOf('x' to 1, 'y' to 2)
+    val nodes = mutableListOf<Node>()
+    nodes.add(Server(true, entriesToReplicate, nodes))
+    nodes.add(Server(false, entriesToReplicate, nodes))
+    launchServers(nodes)
+    nodes.forEach {
+        if (it is Follower) {
+            assert(it.verifyLog(mutableListOf(MetaEntry('x' to 1, 1), MetaEntry('y' to 2, 1) )))
+            assert(it.commitIndex == 2 && it.currentTerm == 1)
+        }
+    }
+    println()
 }
 
 fun oneLeaderOneFollowerScenarioWithConsensus() = runBlocking {
