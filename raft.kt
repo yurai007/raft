@@ -18,7 +18,22 @@ data class RequestVoteResp(val term : Int, val voteGranted : Boolean) : Message
 data class MetaEntry(val entry : Pair<Char, Int>, val term : Int)
 
 abstract class Node() {
+
+    constructor(logState : HashMap<Char, Int>, log : MutableList<MetaEntry>, state : State) : this() {
+        this.logState = logState
+        this.log = log
+        this.state = state
+    }
+
     abstract suspend fun run()
+    open fun me() : Node = this
+
+    fun trackLog() {
+        if (debug) {
+            println("$log")
+        }
+    }
+
     protected var logState = HashMap<Char, Int>()
     protected var log = mutableListOf<MetaEntry>()
     var state: State = State.FOLLOWER_INITIAL
@@ -28,23 +43,18 @@ abstract class Node() {
     protected var lastApplied = 0
     private val debug = true
     protected val rpcTimeoutMs : Long = 25
-
-    constructor(logState : HashMap<Char, Int>, log : MutableList<MetaEntry>, state : State) : this() {
-        this.logState = logState
-        this.log = log
-        this.state = state
-    }
-
-    fun trackLog() {
-        if (debug) {
-            println("$log")
-        }
-    }
 }
 
 open class Follower() : Node() {
 
+    constructor(logState : HashMap<Char, Int>, log : MutableList<MetaEntry>, state : State) : this()  {
+        super.logState = logState
+        super.log = log
+        super.state = state
+    }
+
     override suspend fun run() {
+        println("Follower $this: start")
         state = State.FOLLOWER_INITIAL
         currentTerm++
         commitIndex = max(log.size, 0)
@@ -157,16 +167,17 @@ open class Follower() : Node() {
     }
     private fun done(heartBeat : HeartBeat) : Boolean = heartBeat.done
 
-    constructor(logState : HashMap<Char, Int>, log : MutableList<MetaEntry>, state : State) : this()  {
-        super.logState = logState
-        super.log = log
-        super.state = state
-    }
-
     private val channelToLeader = Channel<Message>()
 }
 
 class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>) : Node() {
+
+    constructor(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>,
+                logState : HashMap<Char, Int>, log : MutableList<MetaEntry>, state : State) : this(followers, entriesToReplicate)  {
+        super.logState = logState
+        super.log = log
+        super.state = state
+    }
 
     override suspend fun run() {
         state = State.LEADER_INITIAL
@@ -265,27 +276,23 @@ class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>
     }
 
     private fun replicaNextIndex(replica : Follower) : Int = nextIndex[replica]!!
+
     private val followers = followers
     private val nextIndex = HashMap<Follower, Int>()
     private val matchIndex = HashMap<Follower, Int>()
     private var entriesToReplicate = entriesToReplicate
     var delayedFollowers = setOf<Follower>()
+
     init {
         this.followers.forEach {
             nextIndex[it] = 0
             matchIndex[it] = -1
         }
     }
-
-    constructor(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>,
-                logState : HashMap<Char, Int>, log : MutableList<MetaEntry>, state : State) : this(followers, entriesToReplicate)  {
-        super.logState = logState
-        super.log = log
-        super.state = state
-    }
 }
 
-class Candidate(otherCandidates : List<Candidate>, logState : HashMap<Char, Int>, log : MutableList<MetaEntry>, state : State) : Node(logState, log, state) {
+class Candidate(otherCandidates : List<Candidate>, logState : HashMap<Char, Int>, log : MutableList<MetaEntry>,
+                state : State) : Node(logState, log, state) {
 
     override suspend fun run() {
         state = State.CANDIDATE
@@ -329,21 +336,30 @@ class Candidate(otherCandidates : List<Candidate>, logState : HashMap<Char, Int>
     private val channel = Channel<Message>()
 }
 
-class Server(asLeader : Boolean, entriesToReplicate : HashMap<Char, Int>, otherNodes : MutableList<Node>) : Node() {
+enum class Instance {
+    FOLLOWER, LEADER, ARTIFICIAL_FOLLOWER
+}
+
+class Server(startingInstance : Instance, entriesToReplicate : HashMap<Char, Int>?, otherNodes : MutableList<Node>,
+             stopOnStateChange : Boolean) : Node() {
 
     override suspend fun run() {
         while (true) {
             node.run()
+            state = node.state
+            if (stopOnStateChange) {
+                return
+            }
             when (state) {
                 State.FOLLOWER_INITIAL -> {
                     node = Follower(logState, log, state)
                 }
                 State.LEADER_INITIAL -> {
-                    val knownFollowers = otherNodes.filter { it is Follower } as List<Follower>
-                    node = Leader(knownFollowers, entriesToReplicate, logState, log, state)
+                    val knownFollowers = otherNodes.map { it.me() }.filter { it is Follower } as List<Follower>
+                    node = Leader(knownFollowers, entriesToReplicate!!, logState, log, state)
                 }
                 State.CANDIDATE -> {
-                    val knownCandidates = otherNodes.filter { it is Candidate } as List<Candidate>
+                    val knownCandidates = otherNodes.map { it.me() }.filter { it is Candidate } as List<Candidate>
                     node = Candidate(knownCandidates, logState, log, state)
                 }
                 State.FOLLOWER_DONE -> return
@@ -352,20 +368,27 @@ class Server(asLeader : Boolean, entriesToReplicate : HashMap<Char, Int>, otherN
         }
     }
 
-    private fun createNode(asLeader : Boolean) : Node {
-        if (asLeader) {
-            val knownFollowers = otherNodes.filter { it is Follower } as List<Follower>
-            return Leader(knownFollowers, entriesToReplicate, logState, log, state)
+    override fun me() : Node = node
+
+    private fun createNode(startingInstance : Instance) : Node {
+        return when (startingInstance) {
+            Instance.LEADER -> {
+                val knownFollowers = otherNodes.map { it.me() }.filter { it is Follower } as List<Follower>
+                Leader(knownFollowers, entriesToReplicate!!, logState, log, state)
+            }
+            Instance.FOLLOWER ->  Follower(logState, log, state)
+            Instance.ARTIFICIAL_FOLLOWER ->  ArtificialFollower(logState, log, state)
         }
-        return Follower(logState, log, state)
     }
 
     private val entriesToReplicate = entriesToReplicate
     private val otherNodes = otherNodes
-    private var node : Node = createNode(asLeader)
+    private var node : Node = createNode(startingInstance)
+    private val stopOnStateChange = stopOnStateChange
 }
 
-class ArtificialFollower : Follower() {
+class ArtificialFollower(logState : HashMap<Char, Int>, log : MutableList<MetaEntry>, state : State) : Follower(logState, log, state) {
+
     fun poison(term : Int, log : MutableList<MetaEntry>) {
         super.currentTerm = term
         super.log = log
@@ -374,94 +397,88 @@ class ArtificialFollower : Follower() {
     }
 }
 
-suspend fun launchLeaderAndFollowers(leader : Leader, followers : List<Follower>) = runBlocking {
-    launch {
-        try {
-            leader.run()
-        } catch (e : Exception) { println("Leader: failed") }
-    }
-    followers.forEach { launch {
-        try {
-            it.run()
-        } catch (e : Exception) { println("Follower: failed") }
-    } }
-}
-
 suspend fun launchServers(servers : List<Node>) = runBlocking {
     servers.forEach { launch {
         try {
             it.run()
-        } catch (e : Exception) { println("$it: failed") }
+        } catch (e : Exception) { println("$it: failed with:     $e") }
     } }
-}
-
-fun oneLeaderOneFollowerScenarioWithConsensus__new() = runBlocking {
-    println("oneLeaderOneFollowerScenarioWithConsensus")
-    val entriesToReplicate = hashMapOf('x' to 1, 'y' to 2)
-    val nodes = mutableListOf<Node>()
-    nodes.add(Server(true, entriesToReplicate, nodes))
-    nodes.add(Server(false, entriesToReplicate, nodes))
-    launchServers(nodes)
-    nodes.forEach {
-        if (it is Follower) {
-            assert(it.verifyLog(mutableListOf(MetaEntry('x' to 1, 1), MetaEntry('y' to 2, 1) )))
-            assert(it.commitIndex == 2 && it.currentTerm == 1)
-        }
-    }
-    println()
 }
 
 fun oneLeaderOneFollowerScenarioWithConsensus() = runBlocking {
     println("oneLeaderOneFollowerScenarioWithConsensus")
-    val followers = listOf(Follower())
     val entriesToReplicate = hashMapOf('x' to 1, 'y' to 2)
-    val leader = Leader(followers, entriesToReplicate)
-    launchLeaderAndFollowers(leader, followers)
-    followers.forEach {
-        assert(it.verifyLog(mutableListOf(MetaEntry('x' to 1, 1), MetaEntry('y' to 2, 1) )))
-        assert(it.commitIndex == 2 && it.currentTerm == 1)
+    val nodes = mutableListOf<Node>()
+    nodes.add(Server(Instance.FOLLOWER, null, nodes, false))
+    nodes.add(Server(Instance.LEADER, entriesToReplicate, nodes, false))
+    launchServers(nodes)
+    nodes.forEach {
+        val node = it.me()
+        if (node is Follower) {
+            assert(node.verifyLog(mutableListOf(MetaEntry('x' to 1, 1), MetaEntry('y' to 2, 1) )))
+            assert(node.commitIndex == 2 && node.currentTerm == 1)
+        }
     }
     println()
 }
 
 fun oneLeaderOneFollowerMoreEntriesScenarioWithConsensus() = runBlocking {
     println("oneLeaderOneFollowerMoreEntriesScenarioWithConsensus")
-    val followers = listOf(Follower())
     val entriesToReplicate = hashMapOf('1' to 1, '2' to 2, '3' to 3, '4' to 2, '5' to 1, '6' to 3)
-    val leader = Leader(followers, entriesToReplicate)
-    launchLeaderAndFollowers(leader, followers)
-    followers.forEach {
-        assert(it.verifyLog(mutableListOf(MetaEntry('1' to 1, 1),
-            MetaEntry('2' to 2, 1), MetaEntry('3' to 3, 1), MetaEntry('4' to 2, 1),
-            MetaEntry('5' to 1, 1), MetaEntry('6' to 3, 1))))
-        assert(it.commitIndex == 6 && it.currentTerm == 1)
+    val nodes = mutableListOf<Node>()
+    nodes.add(Server(Instance.FOLLOWER, null, nodes, false))
+    nodes.add(Server(Instance.LEADER, entriesToReplicate, nodes, false))
+    launchServers(nodes)
+    nodes.forEach {
+        val node = it.me()
+        if (node is Follower) {
+            assert(node.verifyLog(mutableListOf(MetaEntry('1' to 1, 1),
+                MetaEntry('2' to 2, 1), MetaEntry('3' to 3, 1), MetaEntry('4' to 2, 1),
+                MetaEntry('5' to 1, 1), MetaEntry('6' to 3, 1))))
+            assert(node.commitIndex == 6 && node.currentTerm == 1)
+        }
     }
     println()
 }
 
 fun oneLeaderManyFollowersScenarioWithConsensus() = runBlocking {
     println("oneLeaderManyFollowersScenarioWithConsensus")
-    val followers = listOf(Follower(), Follower(), Follower(), Follower(), Follower(), Follower(), Follower(),
-        Follower(), Follower(), Follower(), Follower(), Follower(), Follower())
     val entriesToReplicate = hashMapOf('x' to 1, 'y' to 2)
-    val leader = Leader(followers, entriesToReplicate)
-    launchLeaderAndFollowers(leader, followers)
-    followers.forEach {
-        assert(it.verifyLog(mutableListOf(MetaEntry('x' to 1, 1), MetaEntry('y' to 2, 1) )))
-        assert(it.commitIndex == 2 && it.currentTerm == 1)
+    val nodes = mutableListOf<Node>()
+    for (i in 0..12)
+        nodes.add(Server(Instance.FOLLOWER, null, nodes, false))
+    nodes.add(Server(Instance.LEADER, entriesToReplicate, nodes, false))
+    launchServers(nodes)
+    nodes.forEach {
+        val node = it.me()
+        if (node is Follower) {
+            assert(node.verifyLog(mutableListOf(MetaEntry('x' to 1, 1), MetaEntry('y' to 2, 1) )))
+            assert(node.commitIndex == 2 && node.currentTerm == 1)
+        }
     }
     println()
 }
 
 fun oneLeaderManyFollowersWithArtificialOneScenarioWithConsensus() = runBlocking {
     println("oneLeaderManyFollowersWithArtificialOneScenarioWithConsensus")
-    val followers = listOf(Follower(), Follower(), Follower(), Follower(), Follower(), ArtificialFollower())
     val entriesToReplicate = hashMapOf('x' to 1, 'y' to 2)
-    val leader = Leader(followers, entriesToReplicate)
-    launchLeaderAndFollowers(leader, followers)
-    followers.forEach {
-        assert(it.verifyLog(mutableListOf(MetaEntry('x' to 1, 1), MetaEntry('y' to 2, 1) )))
-        assert(it.commitIndex == 2 && it.currentTerm == 1)
+    val nodes = mutableListOf<Node>()
+    for (i in 0..4)
+        nodes.add(Server(Instance.FOLLOWER, entriesToReplicate, nodes, false))
+    nodes.add(Server(Instance.ARTIFICIAL_FOLLOWER, null, nodes, false))
+    nodes.add(Server(Instance.LEADER, entriesToReplicate, nodes, false))
+    launchServers(nodes)
+    val verify = { node : Follower ->
+        assert(node.verifyLog(mutableListOf(MetaEntry('x' to 1, 1), MetaEntry('y' to 2, 1) )))
+        assert(node.commitIndex == 2 && node.currentTerm == 1)
+    }
+    nodes.forEach {
+        val node = it.me()
+        if (node is Follower) {
+            verify(node)
+        } else  if (node is ArtificialFollower) {
+            verify(node)
+        }
     }
     println()
 }
@@ -469,21 +486,28 @@ fun oneLeaderManyFollowersWithArtificialOneScenarioWithConsensus() = runBlocking
 fun oneLeaderOneFollowerWithArtificialOneScenarioWithConsensus() = runBlocking {
     println("oneLeaderOneFollowerWithArtificialOneScenarioWithConsensus")
     val entries1 = hashMapOf('a' to 1, 'b' to 2)
-    val entries2 = hashMapOf('c' to 3, 'd' to 4)
-    val artificialFollower = ArtificialFollower()
-    val followers = listOf(artificialFollower)
-
-    val leader = Leader(followers, entries1)
+    val nodes = mutableListOf<Node>()
+    nodes.add(Server(Instance.ARTIFICIAL_FOLLOWER, null, nodes, false))
+    val leader = Server(Instance.LEADER, entries1, nodes, false)
+    nodes.add(leader)
     println("Term 1 - replicate entries1")
-    launchLeaderAndFollowers(leader, followers)
-
-    leader.replicateEntries(entries2)
+    launchServers(nodes)
     println("Term 2 - replicate entries2")
-    launchLeaderAndFollowers(leader, followers)
-    followers.forEach {
-        assert(it.verifyLog(mutableListOf(MetaEntry('a' to 1, 1),
+    val entries2 = hashMapOf('c' to 3, 'd' to 4)
+    (leader.me() as Leader).replicateEntries(entries2)
+    launchServers(nodes)
+    val verify = { node : Follower ->
+        assert(node.verifyLog(mutableListOf(MetaEntry('a' to 1, 1),
             MetaEntry('b' to 2, 1), MetaEntry('d' to 4, 2), MetaEntry('c' to 3, 2) )))
-        assert(it.commitIndex == 4 && it.currentTerm == 2)
+        assert(node.commitIndex == 4 && node.currentTerm == 2)
+    }
+    nodes.forEach {
+        val node = it.me()
+        if (node is Follower) {
+            verify(node)
+        } else  if (node is ArtificialFollower) {
+            verify(node)
+        }
     }
     println()
 }
@@ -493,25 +517,37 @@ fun oneLeaderOneFollowerShouldCatchUpWithConsensus() = runBlocking {
     val entries1 = hashMapOf('a' to 1, 'b' to 2)
     val entries2 = hashMapOf('c' to 3, 'd' to 4)
     val entries3 = hashMapOf('e' to 5)
-    val artificialFollower = ArtificialFollower()
-    val followers = listOf(artificialFollower)
-
-    val leader = Leader(followers, entries1)
+    val nodes = mutableListOf<Node>()
+    val follower = Server(Instance.ARTIFICIAL_FOLLOWER, null, nodes, false)
+    nodes.add(follower)
+    val leader = Server(Instance.LEADER, entries1, nodes, false)
+    nodes.add(leader)
+    val leaderInstance = leader.me() as Leader
+    val followerInstance = follower.me() as ArtificialFollower
     println("Term 1 - replicate entries1")
-    launchLeaderAndFollowers(leader, followers)
+    launchServers(nodes)
 
-    leader.replicateEntries(entries2)
+    leaderInstance.replicateEntries(entries2)
     println("Term 2 - replicate entries2")
-    launchLeaderAndFollowers(leader, followers)
+    launchServers(nodes)
 
-    artificialFollower.poison(1, mutableListOf(MetaEntry('a' to 1, 1)))
-    leader.replicateEntries(entries3)
+    followerInstance.poison(1, mutableListOf(MetaEntry('a' to 1, 1)))
+    leaderInstance.replicateEntries(entries3)
     println("Term 3 - replicate entries3; follower log is going to be aligned")
-    launchLeaderAndFollowers(leader, followers)
-    followers.forEach {
-        assert(it.verifyLog(mutableListOf(MetaEntry('a' to 1, 1),
+    launchServers(nodes)
+
+    val verify = { node : Follower ->
+        assert(node.verifyLog(mutableListOf(MetaEntry('a' to 1, 1),
             MetaEntry('b' to 2, 1), MetaEntry('d' to 4, 2), MetaEntry('c' to 3, 2), MetaEntry('e' to 5, 3))))
-        assert(it.commitIndex == 5 && it.currentTerm == 3)
+        assert(node.commitIndex == 5 && node.currentTerm == 3)
+    }
+    nodes.forEach {
+        val node = it.me()
+        if (node is Follower) {
+            verify(node)
+        } else  if (node is ArtificialFollower) {
+            verify(node)
+        }
     }
     println()
 }
@@ -521,29 +557,42 @@ fun oneLeaderOneFollowerShouldRemoveOldEntriesAndCatchUpWithConsensus() = runBlo
     val entries1 = hashMapOf('a' to 1)
     val entries2 = hashMapOf('c' to 3, 'd' to 4)
     val entries3 = hashMapOf('e' to 5)
-    val artificialFollower = ArtificialFollower()
-    val followers = listOf(artificialFollower)
-
-    val leader = Leader(followers, entries1)
+    val nodes = mutableListOf<Node>()
+    val stopOnStateChange = true
+    val follower = Server(Instance.ARTIFICIAL_FOLLOWER, null, nodes, stopOnStateChange)
+    nodes.add(follower)
+    val leader = Server(Instance.LEADER, entries1, nodes, stopOnStateChange)
+    nodes.add(leader)
+    val leaderInstance = leader.me() as Leader
+    val followerInstance = follower.me() as ArtificialFollower
     println("Term 1 - replicate entries1")
-    launchLeaderAndFollowers(leader, followers)
+    launchServers(nodes)
 
-    leader.replicateEntries(hashMapOf())
+    leaderInstance.replicateEntries(hashMapOf())
     println("Term 2 - just bump Leader term")
-    launchLeaderAndFollowers(leader, followers)
+    launchServers(nodes)
 
-    leader.replicateEntries(entries2)
+    leaderInstance.replicateEntries(entries2)
     println("Term 3 - replicate entries2")
-    launchLeaderAndFollowers(leader, followers)
+    launchServers(nodes)
 
-    artificialFollower.poison(2, mutableListOf(MetaEntry('a' to 1, 1), MetaEntry('z' to 3, 2)))
-    leader.replicateEntries(entries3)
+    followerInstance.poison(2, mutableListOf(MetaEntry('a' to 1, 1), MetaEntry('z' to 3, 2)))
+    leaderInstance.replicateEntries(entries3)
     println("Term 4 - replicate entries3; follower log is going to be aligned")
-    launchLeaderAndFollowers(leader, followers)
-    followers.forEach {
-        assert(it.verifyLog(mutableListOf(MetaEntry('a' to 1, 1),
+    launchServers(nodes)
+
+    val verify = { node : Follower ->
+        assert(node.verifyLog(mutableListOf(MetaEntry('a' to 1, 1),
             MetaEntry('d' to 4, 3), MetaEntry('c' to 3, 3), MetaEntry('e' to 5, 4))))
-        assert(it.commitIndex == 4 && it.currentTerm == 4)
+        assert(node.commitIndex == 4 && node.currentTerm == 4)
+    }
+    nodes.forEach {
+        val node = it.me()
+        if (node is Follower) {
+            verify(node)
+        } else  if (node is ArtificialFollower) {
+            verify(node)
+        }
     }
     println()
 }
@@ -553,47 +602,63 @@ fun oneLeaderOneFollowerShouldRemoveButNotAllOldEntriesAndCatchUpWithConsensus()
     val entries1 = hashMapOf('a' to 1)
     val entries2 = hashMapOf('c' to 3, 'd' to 4)
     val entries3 = hashMapOf('e' to 5)
-    val artificialFollower = ArtificialFollower()
-    val followers = listOf(artificialFollower)
-
-    val leader = Leader(followers, entries1)
+    val nodes = mutableListOf<Node>()
+    val stopOnStateChange = true
+    val follower = Server(Instance.ARTIFICIAL_FOLLOWER, null, nodes, stopOnStateChange)
+    nodes.add(follower)
+    val leader = Server(Instance.LEADER, entries1, nodes, stopOnStateChange)
+    nodes.add(leader)
+    val leaderInstance = leader.me() as Leader
+    val followerInstance = follower.me() as ArtificialFollower
     println("Term 1 - replicate entries1")
-    launchLeaderAndFollowers(leader, followers)
+    launchServers(nodes)
 
-    leader.replicateEntries(hashMapOf())
+    leaderInstance.replicateEntries(hashMapOf())
     println("Term 2 & 3 - just bump Leader term")
-    launchLeaderAndFollowers(leader, followers)
-    leader.replicateEntries(hashMapOf())
-    launchLeaderAndFollowers(leader, followers)
+    launchServers(nodes)
+    leaderInstance.replicateEntries(hashMapOf())
+    launchServers(nodes)
 
-    leader.replicateEntries(entries2)
+    leaderInstance.replicateEntries(entries2)
     println("Term 4 - replicate entries2")
-    launchLeaderAndFollowers(leader, followers)
+    launchServers(nodes)
 
-    artificialFollower.poison(4, mutableListOf(MetaEntry('a' to 1, 1),
+    followerInstance.poison(4, mutableListOf(MetaEntry('a' to 1, 1),
         MetaEntry('b' to 1, 1), MetaEntry('x' to 2, 2), MetaEntry('z' to 2, 2), MetaEntry('p' to 3, 3), MetaEntry('q' to 3, 3),
         MetaEntry('c' to 3, 4), MetaEntry('d' to 4, 4)))
-    leader.replicateEntries(entries3)
+    leaderInstance.replicateEntries(entries3)
     println("Term 5 - replicate entries3; follower log is going to be aligned")
-    launchLeaderAndFollowers(leader, followers)
-    followers.forEach {
-        assert(it.verifyLog(mutableListOf(MetaEntry('a' to 1, 1),
+    launchServers(nodes)
+
+    val verify = { node : Follower ->
+        assert(node.verifyLog(mutableListOf(MetaEntry('a' to 1, 1),
             MetaEntry('d' to 4, 4), MetaEntry('c' to 3, 4), MetaEntry('e' to 5, 5))))
-        assert(it.commitIndex == 4 && it.currentTerm == 5)
+        assert(node.commitIndex == 4 && node.currentTerm == 5)
+    }
+    nodes.forEach {
+        val node = it.me()
+        if (node is Follower) {
+            verify(node)
+        } else  if (node is ArtificialFollower) {
+            verify(node)
+        }
     }
     println()
 }
 
 fun oneFailingLeaderOneFollowerScenarioWithNoConsensus() = runBlocking {
     println("oneFailingLeaderOneFollowerScenarioWithNoConsensus")
-    val follower = Follower()
-    val followers = listOf(follower)
-    val set = setOf(follower)
     val entriesToReplicate = hashMapOf('x' to 1, 'y' to 2)
-    val leader = Leader(followers, entriesToReplicate)
-    leader.setupDelaysForReplicasChannel(set)
+    val nodes = mutableListOf<Node>()
+    val stopOnStateChange = true
+    val follower = Server(Instance.FOLLOWER, entriesToReplicate, nodes, stopOnStateChange)
+    nodes.add(follower)
+    val leader = Server(Instance.LEADER, entriesToReplicate, nodes, stopOnStateChange)
+    nodes.add(leader)
+    val set = setOf(follower.me() as Follower)
+    (leader.me() as Leader).setupDelaysForReplicasChannel(set)
     println("Term 1 - HeartBeat is delayed, all servers become candidates")
-    launchLeaderAndFollowers(leader, followers)
+    launchServers(nodes)
     assert(leader.state == State.CANDIDATE && follower.state == State.CANDIDATE)
     println()
 }
