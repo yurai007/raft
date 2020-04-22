@@ -308,8 +308,8 @@ class Candidate(otherCandidates : List<Candidate>, logState : HashMap<Char, Int>
             }
             var votesForMe = 0
             otherCandidates.forEach {
-                val requestVoteResp = receiveRequestVoteResp(it)
-                if (requestVoteResp!!.voteGranted) {
+                val maybeRequestVoteResp = receiveRequestVoteResp(it)
+                if (maybeRequestVoteResp!!.voteGranted) {
                     votesForMe++
                 }
             }
@@ -340,7 +340,7 @@ enum class Instance {
     FOLLOWER, LEADER, ARTIFICIAL_FOLLOWER
 }
 
-class Server(startingInstance : Instance, entriesToReplicate : HashMap<Char, Int>?, otherNodes : MutableList<Node>,
+class Server(startingInstance : Instance, maybeEntriesToReplicate : HashMap<Char, Int>?, otherNodes : MutableList<Node>,
              stopOnStateChange : Boolean) : Node() {
 
     override suspend fun run() {
@@ -356,7 +356,7 @@ class Server(startingInstance : Instance, entriesToReplicate : HashMap<Char, Int
                 }
                 State.LEADER_INITIAL -> {
                     val knownFollowers = otherNodes.map { it.me() }.filter { it is Follower } as List<Follower>
-                    node = Leader(knownFollowers, entriesToReplicate!!, logState, log, state)
+                    node = Leader(knownFollowers, maybeEntriesToReplicate!!, logState, log, state)
                 }
                 State.CANDIDATE -> {
                     val knownCandidates = otherNodes.map { it.me() }.filter { it is Candidate } as List<Candidate>
@@ -374,14 +374,14 @@ class Server(startingInstance : Instance, entriesToReplicate : HashMap<Char, Int
         return when (startingInstance) {
             Instance.LEADER -> {
                 val knownFollowers = otherNodes.map { it.me() }.filter { it is Follower } as List<Follower>
-                Leader(knownFollowers, entriesToReplicate!!, logState, log, state)
+                Leader(knownFollowers, maybeEntriesToReplicate!!, logState, log, state)
             }
             Instance.FOLLOWER ->  Follower(logState, log, state)
             Instance.ARTIFICIAL_FOLLOWER ->  ArtificialFollower(logState, log, state)
         }
     }
 
-    private val entriesToReplicate = entriesToReplicate
+    private val maybeEntriesToReplicate = maybeEntriesToReplicate
     private val otherNodes = otherNodes
     private var node : Node = createNode(startingInstance)
     private val stopOnStateChange = stopOnStateChange
