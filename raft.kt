@@ -2,6 +2,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.*
 import kotlin.math.*
 import kotlin.collections.mutableListOf
+import java.time.LocalDateTime
 
 // ref: https://raft.github.io/raft.pdf
 
@@ -42,7 +43,7 @@ abstract class Node() {
     var commitIndex = 0
     protected var lastApplied = 0
     private val debug = true
-    protected val rpcTimeoutMs : Long = 25
+    protected val rpcTimeoutMs : Long = 50
 }
 
 open class Follower() : Node() {
@@ -59,7 +60,7 @@ open class Follower() : Node() {
         currentTerm++
         commitIndex = max(log.size, 0)
         var maybeHeartBeat = receiveHeartbeat()
-        var maybeAppendEntries : AppendEntriesReq? = null
+        var maybeAppendEntries : AppendEntriesReq?
         while (maybeHeartBeat != null && !done(maybeHeartBeat!!)) {
             maybeAppendEntries = receiveAppendEntriesReq()
             if (maybeAppendEntries == null)
@@ -113,7 +114,7 @@ open class Follower() : Node() {
             }
             maybeHeartBeat = receiveHeartbeat()
         }
-        if (maybeHeartBeat != null && maybeAppendEntries != null) {
+        if (maybeHeartBeat != null && maybeHeartBeat!!.done) {
             state = State.FOLLOWER_DONE
             println("Follower $this: done with commitIndex=$commitIndex")
             trackLog()
@@ -186,6 +187,7 @@ class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>
         entriesToReplicate.forEach { (id, value) ->
             followers.forEach {
                 if (sendHeartbeat(it, false) == null) {
+                    // FIXME: fallback here and there is not the proper way to handle slow Follower
                     return fallbackTo(State.CANDIDATE)
                 }
             }
@@ -291,49 +293,102 @@ class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>
     }
 }
 
-class Candidate(otherCandidates : List<Candidate>, logState : HashMap<Char, Int>, log : MutableList<MetaEntry>,
+object Generator {
+    fun nextInt() : Long = ++counter
+    private var counter : Long = 0
+}
+
+class Candidate(expectedCandidates : Int, otherCandidates : List<Candidate>, logState : HashMap<Char, Int>, log : MutableList<MetaEntry>,
                 state : State) : Node(logState, log, state) {
 
     override suspend fun run() {
         state = State.CANDIDATE
-        currentTerm++
+        println("Candidate $this: start")
         var endOfElection = false
-        // only happy path for now
+        // only main happy path for now
         while (!endOfElection) {
-            otherCandidates.forEach {
-                val lastLogIndex = 0
-                val lastLogTerm = 0
-                val requestVoteReq = RequestVoteReq(currentTerm, hashCode(), lastLogIndex, lastLogTerm)
-                sendRequestVoteReq(it, requestVoteReq)
+            currentTerm++
+            if (otherCandidates.size < expectedCandidates) {
+                println("Candidate $this: too less candidates. Wait half of election timeout to catch up.")
+                delay(rpcTimeoutMs/2)
+                return
             }
-            var votesForMe = 0
-            otherCandidates.forEach {
-                val maybeRequestVoteResp = receiveRequestVoteResp(it)
-                if (maybeRequestVoteResp!!.voteGranted) {
-                    votesForMe++
+            val maybeRequestVoteReq = receiveRequestVoteReq()
+            if (maybeRequestVoteReq != null) {
+                var vote  = true
+                val requestVoteReq = maybeRequestVoteReq!!
+                val maybeVoter = otherCandidates.find { it.hashCode() ==  requestVoteReq.candidateId }
+                val voter = maybeVoter!!
+                if (requestVoteReq.term >= currentTerm) {
+                    if (requestVoteReq.lastLogIndex < 0) {
+                    } else {
+                        assert(false) // FIXME - test it
+                        if (requestVoteReq.lastLogIndex < log.size) {
+                            vote = log[requestVoteReq.lastLogIndex].term <= requestVoteReq.lastLogTerm
+                        } else {
+                            vote = false
+                        }
+                    }
+                } else {
+                   vote  = false
                 }
-            }
-            if (votesForMe > otherCandidates.size/2) {
-                state = State.LEADER_INITIAL
-                endOfElection = true
+                if (vote) {
+                    println("Candidate $this: vote for $voter + transition to Follower")
+                    sendRequestVoteResp(voter, RequestVoteResp(currentTerm, true))
+                    endOfElection = true
+                    state = State.FOLLOWER_INITIAL
+                } else {
+                    sendRequestVoteResp(voter, RequestVoteResp(currentTerm, false))
+                }
+            } else {
+                var votesForMe = 0
+                otherCandidates.forEach {
+                    val lastLogIndex = log.size - 1
+                    val lastLogTerm = if (lastLogIndex >= 0) log[lastLogIndex].term else 0
+                    val requestVoteReq = RequestVoteReq(currentTerm, hashCode(), lastLogIndex, lastLogTerm)
+                    sendRequestVoteReq(it, requestVoteReq)
+                    val maybeRequestVoteResp = receiveRequestVoteResp(this)
+                    if (maybeRequestVoteResp == null) { }
+                    if (maybeRequestVoteResp!!.voteGranted) {
+                        votesForMe++
+                    }
+                }
+                if (votesForMe > otherCandidates.size/2) {
+                    println("Candidate $this: become Leader")
+                    state = State.LEADER_INITIAL
+                    endOfElection = true
+                }
             }
         }
     }
 
-    suspend fun sendRequestVoteReq(candidate : Candidate, requestVote : RequestVoteReq) : Boolean? {
-        return withTimeoutOrNull(rpcTimeoutMs) {
-            candidate.channel.send(requestVote)
-            true
-        }
+    fun setCandidates(otherCandidates : List<Candidate>) {
+        this.otherCandidates = otherCandidates
+    }
+
+    private suspend fun sendRequestVoteReq(candidate : Candidate, requestVote : RequestVoteReq) {
+        candidate.channel.send(requestVote)
+    }
+
+    private suspend fun receiveRequestVoteReq() : RequestVoteReq? {
+        val timeoutMs = Generator.nextInt()*rpcTimeoutMs
+        val message : Message? = withTimeoutOrNull(timeoutMs) { channel.receive() }
+        return message as? RequestVoteReq
+    }
+
+    private suspend fun sendRequestVoteResp(candidate : Candidate, requestVoteResp : RequestVoteResp) {
+        candidate.channel.send(requestVoteResp)
     }
 
     private suspend fun receiveRequestVoteResp(candidate : Candidate) : RequestVoteResp? {
-        val message : Message? = withTimeoutOrNull(rpcTimeoutMs) { candidate.channel.receive() }
+        val timeoutMs = Generator.nextInt()*rpcTimeoutMs
+        val message : Message? = withTimeoutOrNull(timeoutMs) { candidate.channel.receive() }
         return message as? RequestVoteResp
     }
 
-    private val otherCandidates = otherCandidates
+    private var otherCandidates = otherCandidates
     private val channel = Channel<Message>()
+    private val expectedCandidates = expectedCandidates
 }
 
 enum class Instance {
@@ -359,8 +414,12 @@ class Server(startingInstance : Instance, maybeEntriesToReplicate : HashMap<Char
                     node = Leader(knownFollowers, maybeEntriesToReplicate!!, logState, log, state)
                 }
                 State.CANDIDATE -> {
-                    val knownCandidates = otherNodes.map { it.me() }.filter { it is Candidate } as List<Candidate>
-                    node = Candidate(knownCandidates, logState, log, state)
+                    val knownCandidates = otherNodes.map { it.me() }.filter { it is Candidate && it != me() } as List<Candidate>
+                    if (node is Candidate) {
+                        (node as Candidate).setCandidates(knownCandidates)
+                    } else {
+                        node = Candidate(otherNodes.size - 1, knownCandidates, logState, log, state)
+                    }
                 }
                 State.FOLLOWER_DONE -> return
                 State.LEADER_DONE -> return
@@ -663,6 +722,88 @@ fun oneFailingLeaderOneFollowerScenarioWithNoConsensus() = runBlocking {
     println()
 }
 
+fun twoCandidatesInitiateElectionsOneWins() = runBlocking {
+    println("twoCandidatesInitiateElectionsOneWins")
+    val nodes = mutableListOf<Node>()
+    val follower1 = Server(Instance.FOLLOWER, hashMapOf(), nodes, false)
+    nodes.add(follower1)
+    val follower2 = Server(Instance.FOLLOWER, hashMapOf(), nodes, false)
+    nodes.add(follower2)
+    println("All servers become candidates, one wins elections")
+    launchServers(nodes)
+    assert(follower1.state == State.LEADER_DONE || follower2.state == State.LEADER_DONE)
+    println()
+}
+
+fun moreCandidatesInitiateElectionsOneWins() = runBlocking {
+    println("moreCandidatesInitiateElectionsOneWins")
+    val nodes = mutableListOf<Node>()
+    for (i in 0..5) {
+        val follower = Server(Instance.FOLLOWER, hashMapOf(), nodes, false)
+        nodes.add(follower)
+    }
+    println("All servers become candidates, one wins elections")
+    launchServers(nodes)
+    nodes.forEach {
+        val node = it.me()
+        if (node is Follower) {
+            assert(node.state == State.FOLLOWER_DONE)
+        } else {
+            assert(node.state == State.LEADER_DONE)
+        }
+    }
+    println()
+}
+
+fun twoCandidatesInitiateElectionsOneWinsWithConsensus() = runBlocking {
+    println("twoCandidatesInitiateElectionsOneWinsWithConsensus")
+    val entriesToReplicate = hashMapOf('1' to 1, '2' to 2, '3' to 3, '4' to 4, '5' to 5, '6' to 6)
+    val nodes = mutableListOf<Node>()
+    val follower1 = Server(Instance.FOLLOWER, entriesToReplicate, nodes, false)
+    nodes.add(follower1)
+    val follower2 = Server(Instance.FOLLOWER, entriesToReplicate, nodes, false)
+    nodes.add(follower2)
+    println("All servers become candidates, one wins elections and replicate entries")
+    launchServers(nodes)
+    assert(follower1.state == State.LEADER_DONE || follower2.state == State.LEADER_DONE)
+    nodes.forEach {
+        val node = it.me()
+        if (node is Follower) {
+            assert(node.verifyLog(mutableListOf(MetaEntry('1' to 1, 1),
+                MetaEntry('2' to 2, 1), MetaEntry('3' to 3, 1), MetaEntry('4' to 4, 1),
+                MetaEntry('5' to 5, 1), MetaEntry('6' to 6, 1))))
+            assert(node.commitIndex == 6 && node.currentTerm == 1)
+            assert(node.state == State.FOLLOWER_DONE)
+        }
+    }
+    println()
+}
+
+fun moreCandidatesInitiateElectionsOneWinsWithConsensus() = runBlocking {
+    println("moreCandidatesInitiateElectionsOneWinsWithConsensus")
+    val entriesToReplicate = hashMapOf('1' to 1, '2' to 2, '3' to 3, '4' to 4, '5' to 5, '6' to 6)
+    val nodes = mutableListOf<Node>()
+    for (i in 0..5) {
+        val follower = Server(Instance.FOLLOWER, entriesToReplicate, nodes, false)
+        nodes.add(follower)
+    }
+    println("All servers become candidates, one wins elections and replicate entries")
+    launchServers(nodes)
+    nodes.forEach {
+        val node = it.me()
+        if (node is Follower) {
+            assert(node.verifyLog(mutableListOf(MetaEntry('1' to 1, 1),
+                MetaEntry('2' to 2, 1), MetaEntry('3' to 3, 1), MetaEntry('4' to 4, 1),
+                MetaEntry('5' to 5, 1), MetaEntry('6' to 6, 1))))
+            assert(node.commitIndex == 6 && node.currentTerm == 1)
+            assert(node.state == State.FOLLOWER_DONE)
+        } else {
+            assert(node.state == State.LEADER_DONE)
+        }
+    }
+    println()
+}
+
 fun main() {
     oneLeaderOneFollowerScenarioWithConsensus()
     oneLeaderOneFollowerMoreEntriesScenarioWithConsensus()
@@ -673,4 +814,8 @@ fun main() {
     oneLeaderOneFollowerShouldRemoveOldEntriesAndCatchUpWithConsensus()
     oneLeaderOneFollowerShouldRemoveButNotAllOldEntriesAndCatchUpWithConsensus()
     oneFailingLeaderOneFollowerScenarioWithNoConsensus()
+    twoCandidatesInitiateElectionsOneWins()
+    moreCandidatesInitiateElectionsOneWins()
+    twoCandidatesInitiateElectionsOneWinsWithConsensus()
+    moreCandidatesInitiateElectionsOneWinsWithConsensus()
 }
