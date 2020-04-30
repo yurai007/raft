@@ -2,7 +2,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.*
 import kotlin.math.*
 import kotlin.collections.mutableListOf
-import java.time.LocalDateTime
+import kotlin.ranges.random
 
 // ref: https://raft.github.io/raft.pdf
 
@@ -43,7 +43,7 @@ abstract class Node() {
     var commitIndex = 0
     protected var lastApplied = 0
     private val debug = true
-    protected val rpcTimeoutMs : Long = 50
+    protected val rpcTimeoutMs : Long = 30
 }
 
 open class Follower() : Node() {
@@ -265,6 +265,8 @@ class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>
         delayedFollowers = delayedFollowers_
     }
 
+    fun getCurrentLog() : MutableList<MetaEntry> = log
+
     private suspend fun sendHeartbeat(replica : Follower, done : Boolean) : Boolean? {
         if (replica in delayedFollowers) {
             delay(2*rpcTimeoutMs)
@@ -425,6 +427,10 @@ class Server(startingInstance : Instance, maybeEntriesToReplicate : HashMap<Char
                 State.LEADER_DONE -> return
             }
         }
+    }
+
+    fun delayRandomChannels() {
+
     }
 
     override fun me() : Node = node
@@ -748,8 +754,10 @@ fun moreCandidatesInitiateElectionsOneWins() = runBlocking {
         val node = it.me()
         if (node is Follower) {
             assert(node.state == State.FOLLOWER_DONE)
-        } else {
+        } else if (node is Leader ){
             assert(node.state == State.LEADER_DONE)
+        } else {
+            assert(false)
         }
     }
     println()
@@ -774,6 +782,10 @@ fun twoCandidatesInitiateElectionsOneWinsWithConsensus() = runBlocking {
                 MetaEntry('5' to 5, 1), MetaEntry('6' to 6, 1))))
             assert(node.commitIndex == 6 && node.currentTerm == 1)
             assert(node.state == State.FOLLOWER_DONE)
+        } else if (node is Leader) {
+            assert(node.state == State.LEADER_DONE)
+        } else {
+            assert(false)
         }
     }
     println()
@@ -797,8 +809,49 @@ fun moreCandidatesInitiateElectionsOneWinsWithConsensus() = runBlocking {
                 MetaEntry('5' to 5, 1), MetaEntry('6' to 6, 1))))
             assert(node.commitIndex == 6 && node.currentTerm == 1)
             assert(node.state == State.FOLLOWER_DONE)
-        } else {
+        } else if (node is Leader) {
             assert(node.state == State.LEADER_DONE)
+        } else {
+            assert(false)
+        }
+    }
+    println()
+}
+
+private fun generateRandomLog(size : Int, maxTerm : Int) : MutableList<MetaEntry> {
+    val list = MutableList(size) { (1..maxTerm).random() }.sorted()
+    return list.map { MetaEntry('a' to it, it) }
+               .toMutableList()
+}
+
+private fun Int.toBoolean() = (this > 0)
+
+fun stressTest() = runBlocking {
+    val logSize = 10
+    val logToPoison = generateRandomLog(logSize, 10)
+    println("stressTest:    size= $logSize, logToPoison = $logToPoison")
+    val nodes = mutableListOf<Node>()
+    for (i in 0..15) {
+        val follower = Server(Instance.ARTIFICIAL_FOLLOWER, null, nodes, false)
+        (follower.me() as ArtificialFollower).poison(1, logToPoison.filter { (0..1).random().toBoolean() }
+                                                                   .toMutableList() )
+        follower.delayRandomChannels()
+        nodes.add(follower)
+    }
+    println("All servers become candidates, eventually one of injected log should be replicated to all")
+    launchServers(nodes)
+    val leader = nodes.filter {it.me() is Leader} as Leader
+    val leaderLog = leader.getCurrentLog()
+    nodes.forEach {
+        val node = it.me()
+        if (node is Follower) {
+            assert(node.verifyLog(leaderLog))
+            assert(node.commitIndex == logSize)
+            assert(node.state == State.FOLLOWER_DONE)
+        } else if (node is Leader) {
+            assert(node.state == State.LEADER_DONE)
+        } else {
+            assert(false)
         }
     }
     println()
@@ -818,4 +871,5 @@ fun main() {
     moreCandidatesInitiateElectionsOneWins()
     twoCandidatesInitiateElectionsOneWinsWithConsensus()
     moreCandidatesInitiateElectionsOneWinsWithConsensus()
+    stressTest()
 }
