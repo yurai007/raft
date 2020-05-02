@@ -7,7 +7,7 @@ import kotlin.ranges.random
 // ref: https://raft.github.io/raft.pdf
 
 enum class State {
-    FOLLOWER_INITIAL, FOLLOWER_DONE, CANDIDATE, LEADER_INITIAL, LEADER_DONE
+    FOLLOWER, CANDIDATE, LEADER, DONE
 }
 
 interface Message
@@ -37,7 +37,7 @@ abstract class Node() {
 
     protected var logState = HashMap<Char, Int>()
     protected var log = mutableListOf<MetaEntry>()
-    var state: State = State.FOLLOWER_INITIAL
+    var state: State = State.FOLLOWER
 
     var currentTerm = 0
     var commitIndex = 0
@@ -48,15 +48,16 @@ abstract class Node() {
 
 open class Follower() : Node() {
 
-    constructor(logState : HashMap<Char, Int>, log : MutableList<MetaEntry>, state : State) : this()  {
+    constructor(logState : HashMap<Char, Int>, log : MutableList<MetaEntry>, state : State, delayed : Boolean) : this()  {
         super.logState = logState
         super.log = log
         super.state = state
+        this.delayed = delayed
     }
 
     override suspend fun run() {
         println("Follower $this: start")
-        state = State.FOLLOWER_INITIAL
+        state = State.FOLLOWER
         currentTerm++
         commitIndex = max(log.size, 0)
         var maybeHeartBeat = receiveHeartbeat()
@@ -115,7 +116,7 @@ open class Follower() : Node() {
             maybeHeartBeat = receiveHeartbeat()
         }
         if (maybeHeartBeat != null && maybeHeartBeat!!.done) {
-            state = State.FOLLOWER_DONE
+            state = State.DONE
             println("Follower $this: done with commitIndex=$commitIndex")
             trackLog()
         } else {
@@ -136,6 +137,9 @@ open class Follower() : Node() {
     fun verifyLog(expectedLog : MutableList<MetaEntry> ) : Boolean = expectedLog == log
 
     suspend fun sendHeartbeat(done : Boolean) : Boolean? {
+        if (delayed) {
+            delay(2*rpcTimeoutMs)
+        }
         return withTimeoutOrNull(rpcTimeoutMs) {
             channelToLeader.send(HeartBeat(done))
             true
@@ -169,6 +173,7 @@ open class Follower() : Node() {
     private fun done(heartBeat : HeartBeat) : Boolean = heartBeat.done
 
     private val channelToLeader = Channel<Message>()
+    private var delayed = false
 }
 
 class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>) : Node() {
@@ -181,7 +186,7 @@ class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>
     }
 
     override suspend fun run() {
-        state = State.LEADER_INITIAL
+        state = State.LEADER
         currentTerm++
         println("Leader of term $currentTerm")
         entriesToReplicate.forEach { (id, value) ->
@@ -213,7 +218,7 @@ class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>
                         println("Leader: No consensus for $entry")
                         if (!response.success && response.term > currentTerm) {
                             // [5.1]
-                            return fallbackTo(State.FOLLOWER_INITIAL)
+                            return fallbackTo(State.FOLLOWER)
                         }
                         // [5.3]
                         nextIndex[it] = replicaNextIndex(it) - 1
@@ -253,7 +258,7 @@ class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>
             println("Leader: $id := $value")
         }
         followers.forEach {sendHeartbeat(it, true)}
-        state = State.LEADER_DONE
+        state = State.DONE
         println("Leader: done with commitIndex=$commitIndex")
     }
 
@@ -261,16 +266,10 @@ class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>
         entriesToReplicate = entriesToReplicate_
     }
 
-    fun setupDelaysForReplicasChannel(delayedFollowers_ : Set<Follower>) {
-        delayedFollowers = delayedFollowers_
-    }
 
     fun getCurrentLog() : MutableList<MetaEntry> = log
 
     private suspend fun sendHeartbeat(replica : Follower, done : Boolean) : Boolean? {
-        if (replica in delayedFollowers) {
-            delay(2*rpcTimeoutMs)
-        }
         return replica.sendHeartbeat(done)
     }
 
@@ -285,7 +284,6 @@ class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>
     private val nextIndex = HashMap<Follower, Int>()
     private val matchIndex = HashMap<Follower, Int>()
     private var entriesToReplicate = entriesToReplicate
-    var delayedFollowers = setOf<Follower>()
 
     init {
         this.followers.forEach {
@@ -315,33 +313,39 @@ class Candidate(expectedCandidates : Int, otherCandidates : List<Candidate>, log
                 delay(rpcTimeoutMs/2)
                 return
             }
-            val maybeRequestVoteReq = receiveRequestVoteReq()
-            if (maybeRequestVoteReq != null) {
+            val maybeMessage = receiveRequestVoteReqOrLeaderMessage()
+            if (maybeMessage != null) {
                 var vote  = true
-                val requestVoteReq = maybeRequestVoteReq!!
-                val maybeVoter = otherCandidates.find { it.hashCode() ==  requestVoteReq.candidateId }
-                val voter = maybeVoter!!
-                if (requestVoteReq.term >= currentTerm) {
-                    if (requestVoteReq.lastLogIndex < 0) {
-                    } else {
-                        assert(false) // FIXME - test it
-                        if (requestVoteReq.lastLogIndex < log.size) {
-                            vote = log[requestVoteReq.lastLogIndex].term <= requestVoteReq.lastLogTerm
+                val message = maybeMessage!!
+                if (message is RequestVoteReq) {
+                        val maybeVoter = otherCandidates.find { it.hashCode() == message.candidateId }
+                        val voter = maybeVoter!!
+                        if (message.term >= currentTerm) {
+                            if (message.lastLogIndex < 0) {
+                            } else {
+                                assert(false) // FIXME - test it
+                                if (message.lastLogIndex < log.size) {
+                                    vote = log[message.lastLogIndex].term <= message.lastLogTerm
+                                } else {
+                                    vote = false
+                                }
+                            }
                         } else {
                             vote = false
                         }
+                        if (vote) {
+                            println("Candidate $this: vote for $voter + transition to Follower")
+                            sendRequestVoteResp(voter, RequestVoteResp(currentTerm, true))
+                            endOfElection = true
+                            state = State.FOLLOWER
+                        } else {
+                            sendRequestVoteResp(voter, RequestVoteResp(currentTerm, false))
+                        }
+                    } else if (message is AppendEntriesReq || message is HeartBeat) {
+                        println("Candidate $this: received Leader's message. Transition to Follower")
+                        endOfElection = true
+                        state = State.FOLLOWER
                     }
-                } else {
-                   vote  = false
-                }
-                if (vote) {
-                    println("Candidate $this: vote for $voter + transition to Follower")
-                    sendRequestVoteResp(voter, RequestVoteResp(currentTerm, true))
-                    endOfElection = true
-                    state = State.FOLLOWER_INITIAL
-                } else {
-                    sendRequestVoteResp(voter, RequestVoteResp(currentTerm, false))
-                }
             } else {
                 var votesForMe = 0
                 otherCandidates.forEach {
@@ -349,15 +353,22 @@ class Candidate(expectedCandidates : Int, otherCandidates : List<Candidate>, log
                     val lastLogTerm = if (lastLogIndex >= 0) log[lastLogIndex].term else 0
                     val requestVoteReq = RequestVoteReq(currentTerm, hashCode(), lastLogIndex, lastLogTerm)
                     sendRequestVoteReq(it, requestVoteReq)
-                    val maybeRequestVoteResp = receiveRequestVoteResp(this)
-                    if (maybeRequestVoteResp == null) { }
-                    if (maybeRequestVoteResp!!.voteGranted) {
-                        votesForMe++
+                    val maybeMessage = receiveRequestVoteRespOrLeaderMessage(this)
+                    if (maybeMessage == null) {
+                    } else {
+                        val message = maybeMessage!!
+                        if (message is RequestVoteResp && message.voteGranted) {
+                            votesForMe++
+                        } else if (message is AppendEntriesReq || message is HeartBeat) {
+                            println("Candidate $this: received Leader's message. Transition to Follower")
+                            endOfElection = true
+                            state = State.FOLLOWER
+                        }
                     }
                 }
                 if (votesForMe > otherCandidates.size/2) {
                     println("Candidate $this: become Leader")
-                    state = State.LEADER_INITIAL
+                    state = State.LEADER
                     endOfElection = true
                 }
             }
@@ -372,21 +383,19 @@ class Candidate(expectedCandidates : Int, otherCandidates : List<Candidate>, log
         candidate.channel.send(requestVote)
     }
 
-    private suspend fun receiveRequestVoteReq() : RequestVoteReq? {
+    private suspend fun receiveRequestVoteReqOrLeaderMessage() : Message? {
         val timeoutMs = Generator.nextInt()*rpcTimeoutMs
-        val message : Message? = withTimeoutOrNull(timeoutMs) { channel.receive() }
-        return message as? RequestVoteReq
+        return withTimeoutOrNull(timeoutMs) { channel.receive() }
     }
 
-    private suspend fun sendRequestVoteResp(candidate : Candidate, requestVoteResp : RequestVoteResp) {
-        candidate.channel.send(requestVoteResp)
-    }
+        private suspend fun sendRequestVoteResp(candidate : Candidate, requestVoteResp : RequestVoteResp) {
+            candidate.channel.send(requestVoteResp)
+        }
 
-    private suspend fun receiveRequestVoteResp(candidate : Candidate) : RequestVoteResp? {
-        val timeoutMs = Generator.nextInt()*rpcTimeoutMs
-        val message : Message? = withTimeoutOrNull(timeoutMs) { candidate.channel.receive() }
-        return message as? RequestVoteResp
-    }
+        private suspend fun receiveRequestVoteRespOrLeaderMessage(candidate : Candidate) : Message? {
+            val timeoutMs = Generator.nextInt()*rpcTimeoutMs
+            return withTimeoutOrNull(timeoutMs) { candidate.channel.receive() }
+        }
 
     private var otherCandidates = otherCandidates
     private val channel = Channel<Message>()
@@ -398,20 +407,17 @@ enum class Instance {
 }
 
 class Server(startingInstance : Instance, maybeEntriesToReplicate : HashMap<Char, Int>?, otherNodes : MutableList<Node>,
-             stopOnStateChange : Boolean) : Node() {
+             stopOnStateChangeOnce : Boolean, delayed : Boolean = false) : Node() {
 
     override suspend fun run() {
         while (true) {
             node.run()
             state = node.state
-            if (stopOnStateChange) {
-                return
-            }
             when (state) {
-                State.FOLLOWER_INITIAL -> {
-                    node = Follower(logState, log, state)
+                State.FOLLOWER -> {
+                    node = Follower(logState, log, state, delayed)
                 }
-                State.LEADER_INITIAL -> {
+                State.LEADER -> {
                     val knownFollowers = otherNodes.map { it.me() }.filter { it is Follower } as List<Follower>
                     node = Leader(knownFollowers, maybeEntriesToReplicate!!, logState, log, state)
                 }
@@ -423,14 +429,13 @@ class Server(startingInstance : Instance, maybeEntriesToReplicate : HashMap<Char
                         node = Candidate(otherNodes.size - 1, knownCandidates, logState, log, state)
                     }
                 }
-                State.FOLLOWER_DONE -> return
-                State.LEADER_DONE -> return
+                State.DONE -> return
+            }
+            if (stopOnStateChangeOnce) {
+                stopOnStateChangeOnce = false
+                return
             }
         }
-    }
-
-    fun delayRandomChannels() {
-
     }
 
     override fun me() : Node = node
@@ -441,18 +446,20 @@ class Server(startingInstance : Instance, maybeEntriesToReplicate : HashMap<Char
                 val knownFollowers = otherNodes.map { it.me() }.filter { it is Follower } as List<Follower>
                 Leader(knownFollowers, maybeEntriesToReplicate!!, logState, log, state)
             }
-            Instance.FOLLOWER ->  Follower(logState, log, state)
-            Instance.ARTIFICIAL_FOLLOWER ->  ArtificialFollower(logState, log, state)
+            Instance.FOLLOWER ->  Follower(logState, log, state, delayed)
+            Instance.ARTIFICIAL_FOLLOWER ->  ArtificialFollower(logState, log, state, delayed)
         }
     }
 
     private val maybeEntriesToReplicate = maybeEntriesToReplicate
     private val otherNodes = otherNodes
+    private var stopOnStateChangeOnce = stopOnStateChangeOnce
+    private var delayed = delayed
     private var node : Node = createNode(startingInstance)
-    private val stopOnStateChange = stopOnStateChange
 }
 
-class ArtificialFollower(logState : HashMap<Char, Int>, log : MutableList<MetaEntry>, state : State) : Follower(logState, log, state) {
+class ArtificialFollower(logState : HashMap<Char, Int>, log : MutableList<MetaEntry>, state : State, delayed : Boolean)
+    : Follower(logState, log, state, delayed) {
 
     fun poison(term : Int, log : MutableList<MetaEntry>) {
         super.currentTerm = term
@@ -716,15 +723,45 @@ fun oneFailingLeaderOneFollowerScenarioWithNoConsensus() = runBlocking {
     val entriesToReplicate = hashMapOf('x' to 1, 'y' to 2)
     val nodes = mutableListOf<Node>()
     val stopOnStateChange = true
-    val follower = Server(Instance.FOLLOWER, entriesToReplicate, nodes, stopOnStateChange)
+    val delayFollower = true
+    val follower = Server(Instance.FOLLOWER, entriesToReplicate, nodes, stopOnStateChange, delayFollower)
     nodes.add(follower)
     val leader = Server(Instance.LEADER, entriesToReplicate, nodes, stopOnStateChange)
     nodes.add(leader)
-    val set = setOf(follower.me() as Follower)
-    (leader.me() as Leader).setupDelaysForReplicasChannel(set)
     println("Term 1 - HeartBeat is delayed, all servers become candidates")
     launchServers(nodes)
     assert(leader.state == State.CANDIDATE && follower.state == State.CANDIDATE)
+    println()
+}
+
+fun oneFailingLeaderOneFollowerScenarioWithConsensus() = runBlocking {
+    println("oneFailingLeaderOneFollowerScenarioWithNoConsensus")
+    val entriesToReplicate = hashMapOf('x' to 1, 'y' to 2)
+    val nodes = mutableListOf<Node>()
+    val stopOnStateChange = true
+    val delayFollower = true
+    val follower = Server(Instance.FOLLOWER, entriesToReplicate, nodes, stopOnStateChange, delayFollower)
+    nodes.add(follower)
+    val leader = Server(Instance.LEADER, entriesToReplicate, nodes, stopOnStateChange)
+    nodes.add(leader)
+    println("Term 1 - HeartBeat is delayed, all servers become candidates")
+    launchServers(nodes)
+    assert(leader.state == State.CANDIDATE && follower.state == State.CANDIDATE)
+    println("Term 2 - one wins elections and replicate entries")
+    launchServers(nodes)
+    nodes.forEach {
+        val node = it.me()
+        if (node is Follower) {
+            assert(node.verifyLog(mutableListOf(MetaEntry('x' to 1, 1),
+                MetaEntry('y' to 2, 1))))
+            assert(node.commitIndex == 2 && node.currentTerm == 1)
+            assert(node.state == State.DONE)
+        } else if (node is Leader ){
+            assert(node.state == State.DONE)
+        } else {
+            assert(false)
+        }
+    }
     println()
 }
 
@@ -737,7 +774,7 @@ fun twoCandidatesInitiateElectionsOneWins() = runBlocking {
     nodes.add(follower2)
     println("All servers become candidates, one wins elections")
     launchServers(nodes)
-    assert(follower1.state == State.LEADER_DONE || follower2.state == State.LEADER_DONE)
+    assert(follower1.state == State.DONE && follower2.state == State.DONE)
     println()
 }
 
@@ -753,9 +790,9 @@ fun moreCandidatesInitiateElectionsOneWins() = runBlocking {
     nodes.forEach {
         val node = it.me()
         if (node is Follower) {
-            assert(node.state == State.FOLLOWER_DONE)
+            assert(node.state == State.DONE)
         } else if (node is Leader ){
-            assert(node.state == State.LEADER_DONE)
+            assert(node.state == State.DONE)
         } else {
             assert(false)
         }
@@ -773,7 +810,7 @@ fun twoCandidatesInitiateElectionsOneWinsWithConsensus() = runBlocking {
     nodes.add(follower2)
     println("All servers become candidates, one wins elections and replicate entries")
     launchServers(nodes)
-    assert(follower1.state == State.LEADER_DONE || follower2.state == State.LEADER_DONE)
+    assert(follower1.state == State.DONE && follower2.state == State.DONE)
     nodes.forEach {
         val node = it.me()
         if (node is Follower) {
@@ -781,9 +818,9 @@ fun twoCandidatesInitiateElectionsOneWinsWithConsensus() = runBlocking {
                 MetaEntry('2' to 2, 1), MetaEntry('3' to 3, 1), MetaEntry('4' to 4, 1),
                 MetaEntry('5' to 5, 1), MetaEntry('6' to 6, 1))))
             assert(node.commitIndex == 6 && node.currentTerm == 1)
-            assert(node.state == State.FOLLOWER_DONE)
+            assert(node.state == State.DONE)
         } else if (node is Leader) {
-            assert(node.state == State.LEADER_DONE)
+            assert(node.state == State.DONE)
         } else {
             assert(false)
         }
@@ -808,9 +845,9 @@ fun moreCandidatesInitiateElectionsOneWinsWithConsensus() = runBlocking {
                 MetaEntry('2' to 2, 1), MetaEntry('3' to 3, 1), MetaEntry('4' to 4, 1),
                 MetaEntry('5' to 5, 1), MetaEntry('6' to 6, 1))))
             assert(node.commitIndex == 6 && node.currentTerm == 1)
-            assert(node.state == State.FOLLOWER_DONE)
+            assert(node.state == State.DONE)
         } else if (node is Leader) {
-            assert(node.state == State.LEADER_DONE)
+            assert(node.state == State.DONE)
         } else {
             assert(false)
         }
@@ -832,10 +869,10 @@ fun stressTest() = runBlocking {
     println("stressTest:    size= $logSize, logToPoison = $logToPoison")
     val nodes = mutableListOf<Node>()
     for (i in 0..15) {
-        val follower = Server(Instance.ARTIFICIAL_FOLLOWER, null, nodes, false)
+        val delayRandomly = (0..1).random().toBoolean()
+        val follower = Server(Instance.ARTIFICIAL_FOLLOWER, null, nodes, false, delayRandomly)
         (follower.me() as ArtificialFollower).poison(1, logToPoison.filter { (0..1).random().toBoolean() }
                                                                    .toMutableList() )
-        follower.delayRandomChannels()
         nodes.add(follower)
     }
     println("All servers become candidates, eventually one of injected log should be replicated to all")
@@ -847,9 +884,9 @@ fun stressTest() = runBlocking {
         if (node is Follower) {
             assert(node.verifyLog(leaderLog))
             assert(node.commitIndex == logSize)
-            assert(node.state == State.FOLLOWER_DONE)
+            assert(node.state == State.DONE)
         } else if (node is Leader) {
-            assert(node.state == State.LEADER_DONE)
+            assert(node.state == State.DONE)
         } else {
             assert(false)
         }
@@ -867,6 +904,7 @@ fun main() {
     oneLeaderOneFollowerShouldRemoveOldEntriesAndCatchUpWithConsensus()
     oneLeaderOneFollowerShouldRemoveButNotAllOldEntriesAndCatchUpWithConsensus()
     oneFailingLeaderOneFollowerScenarioWithNoConsensus()
+    oneFailingLeaderOneFollowerScenarioWithConsensus()
     twoCandidatesInitiateElectionsOneWins()
     moreCandidatesInitiateElectionsOneWins()
     twoCandidatesInitiateElectionsOneWinsWithConsensus()
